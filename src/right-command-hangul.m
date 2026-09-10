@@ -131,23 +131,46 @@ int main(int argc, const char *argv[]) {
         signal(SIGTERM, stop_handler);
         signal(SIGINT, stop_handler);
 
-        id activity = [[NSProcessInfo processInfo]
-            beginActivityWithOptions:(NSActivityUserInitiatedAllowingIdleSystemSleep |
-                                      NSActivityLatencyCritical)
-                             reason:@"Waiting for Right Command input"];
-
-        BOOL was_down = NO;
-        while (gRunning) {
-            @autoreleasepool {
-                BOOL is_down = CGEventSourceKeyState(
-                    kCGEventSourceStateCombinedSessionState, kTriggerKeyCode);
-                if (is_down && !was_down) toggle_source();
-                was_down = is_down;
-            }
-            usleep(2000);
+        EventHotKeyID hotkey_id = {
+            .signature = 0x52434847, // RCHG
+            .id = 1
+        };
+        EventHotKeyRef hotkey = NULL;
+        OSStatus registration_status = RegisterEventHotKey(
+            kTriggerKeyCode, 0, hotkey_id, GetApplicationEventTarget(), 0,
+            &hotkey);
+        if (registration_status != noErr) {
+            NSLog(@"Could not register F18 hotkey (status: %d)",
+                  registration_status);
+            return 1;
         }
 
-        [[NSProcessInfo processInfo] endActivity:activity];
+        EventTypeSpec event_type = {
+            .eventClass = kEventClassKeyboard,
+            .eventKind = kEventHotKeyPressed
+        };
+        while (gRunning) {
+            EventRef event = NULL;
+            OSStatus receive_status = ReceiveNextEvent(
+                1, &event_type, 1.0, true, &event);
+            if (receive_status == eventLoopTimedOutErr) continue;
+            if (receive_status != noErr) {
+                NSLog(@"Could not receive hotkey event (status: %d)",
+                      receive_status);
+                continue;
+            }
+
+            EventHotKeyID received_id = {0};
+            OSStatus parameter_status = GetEventParameter(
+                event, kEventParamDirectObject, typeEventHotKeyID, NULL,
+                sizeof(received_id), NULL, &received_id);
+            if (parameter_status == noErr && received_id.id == hotkey_id.id) {
+                toggle_source();
+            }
+            ReleaseEvent(event);
+        }
+
+        UnregisterEventHotKey(hotkey);
     }
     return 0;
 }
