@@ -29,6 +29,7 @@ plutil -replace StandardOutPath -string "$log_dir/right-command-hangul.log" "$ag
 plutil -replace StandardErrorPath -string "$log_dir/right-command-hangul.log" "$agent_path"
 
 launchctl bootout "gui/$user_id/$label" >/dev/null 2>&1 || true
+sleep 1
 launchctl bootstrap "gui/$user_id" "$agent_path"
 
 printf '%s\n' "Installed. Right Command now switches between Korean and Latin input sources."

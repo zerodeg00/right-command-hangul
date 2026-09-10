@@ -69,6 +69,10 @@ static BOOL toggle_source(void) {
     NSArray *sources = enabled_keyboard_sources();
     TISInputSourceRef target = find_source(sources, target_is_korean);
     OSStatus status = target ? TISSelectInputSource(target) : paramErr;
+    if (status == noErr) {
+        usleep(30000);
+        status = TISSelectInputSource(target);
+    }
 
     CFRelease(current);
     if (status != noErr) {
@@ -127,6 +131,11 @@ int main(int argc, const char *argv[]) {
         signal(SIGTERM, stop_handler);
         signal(SIGINT, stop_handler);
 
+        id activity = [[NSProcessInfo processInfo]
+            beginActivityWithOptions:(NSActivityUserInitiatedAllowingIdleSystemSleep |
+                                      NSActivityLatencyCritical)
+                             reason:@"Waiting for Right Command input"];
+
         BOOL was_down = NO;
         while (gRunning) {
             @autoreleasepool {
@@ -135,8 +144,10 @@ int main(int argc, const char *argv[]) {
                 if (is_down && !was_down) toggle_source();
                 was_down = is_down;
             }
-            usleep(10000);
+            usleep(2000);
         }
+
+        [[NSProcessInfo processInfo] endActivity:activity];
     }
     return 0;
 }
