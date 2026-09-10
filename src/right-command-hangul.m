@@ -60,12 +60,7 @@ static TISInputSourceRef find_source(NSArray *sources, BOOL korean) {
     return nil;
 }
 
-static BOOL toggle_source(void) {
-    TISInputSourceRef current = TISCopyCurrentKeyboardInputSource();
-    if (!current) return NO;
-
-    NSString *current_id = source_string(current, kTISPropertyInputSourceID);
-    BOOL target_is_korean = [current_id hasPrefix:kKoreanSourcePrefix] == NO;
+static BOOL select_target_source(BOOL target_is_korean) {
     NSArray *sources = enabled_keyboard_sources();
     TISInputSourceRef target = find_source(sources, target_is_korean);
     OSStatus status = target ? TISSelectInputSource(target) : paramErr;
@@ -74,12 +69,23 @@ static BOOL toggle_source(void) {
         status = TISSelectInputSource(target);
     }
 
-    CFRelease(current);
     if (status != noErr) {
         NSLog(@"Could not switch input source (status: %d)", status);
         return NO;
     }
     return YES;
+}
+
+static BOOL toggle_source(BOOL *target_is_korean_out) {
+    TISInputSourceRef current = TISCopyCurrentKeyboardInputSource();
+    if (!current) return NO;
+
+    NSString *current_id = source_string(current, kTISPropertyInputSourceID);
+    BOOL target_is_korean = [current_id hasPrefix:kKoreanSourcePrefix] == NO;
+    CFRelease(current);
+
+    if (target_is_korean_out) *target_is_korean_out = target_is_korean;
+    return select_target_source(target_is_korean);
 }
 
 static void print_current_source(void) {
@@ -115,7 +121,7 @@ int main(int argc, const char *argv[]) {
             return 0;
         }
         if (argc == 2 && strcmp(argv[1], "--toggle") == 0) {
-            return toggle_source() ? 0 : 1;
+            return toggle_source(NULL) ? 0 : 1;
         }
         if (argc == 2 && strcmp(argv[1], "--apply-mapping") == 0) {
             return set_right_command_mapping(YES);
@@ -145,14 +151,22 @@ int main(int argc, const char *argv[]) {
             return 1;
         }
 
-        EventTypeSpec event_type = {
-            .eventClass = kEventClassKeyboard,
-            .eventKind = kEventHotKeyPressed
+        EventTypeSpec event_types[] = {
+            {
+                .eventClass = kEventClassKeyboard,
+                .eventKind = kEventHotKeyPressed
+            },
+            {
+                .eventClass = kEventClassKeyboard,
+                .eventKind = kEventHotKeyReleased
+            }
         };
+        BOOL pending_target_is_korean = NO;
+        BOOL has_pending_target = NO;
         while (gRunning) {
             EventRef event = NULL;
             OSStatus receive_status = ReceiveNextEvent(
-                1, &event_type, 1.0, true, &event);
+                2, event_types, 1.0, true, &event);
             if (receive_status == eventLoopTimedOutErr) continue;
             if (receive_status != noErr) {
                 NSLog(@"Could not receive hotkey event (status: %d)",
@@ -165,7 +179,15 @@ int main(int argc, const char *argv[]) {
                 event, kEventParamDirectObject, typeEventHotKeyID, NULL,
                 sizeof(received_id), NULL, &received_id);
             if (parameter_status == noErr && received_id.id == hotkey_id.id) {
-                toggle_source();
+                UInt32 event_kind = GetEventKind(event);
+                if (event_kind == kEventHotKeyPressed) {
+                    has_pending_target = toggle_source(
+                        &pending_target_is_korean);
+                } else if (event_kind == kEventHotKeyReleased &&
+                           has_pending_target) {
+                    select_target_source(pending_target_is_korean);
+                    has_pending_target = NO;
+                }
             }
             ReleaseEvent(event);
         }
