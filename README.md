@@ -1,10 +1,10 @@
 # Right Command Hangul
 
-macOS에서 오른쪽 `Command(⌘)` 키를 한/영 전환키로 바꿔 주는 작고 단순한
-유틸리티입니다.
+macOS에서 오른쪽 `Command(⌘)` 키와 Windows 키보드의 오른쪽 `Alt` 키를
+한/영 전환키로 바꿔 주는 작고 단순한 유틸리티입니다.
 
-MacBook 내장 키보드와 macOS 모드로 연결된 외장 키보드에서 사용할 수
-있습니다. Caps Lock과 왼쪽 `⌘`는 원래 기능을 그대로 유지합니다.
+MacBook 내장 키보드와 macOS 또는 Windows 모드로 연결된 외장 키보드에서
+사용할 수 있습니다. Caps Lock과 왼쪽 `⌘`는 원래 기능을 그대로 유지합니다.
 
 ## 왜 만들었나요?
 
@@ -70,9 +70,11 @@ cd right-command-hangul
 
 ## 사용 방법
 
-오른쪽 `⌘`를 짧게 누르면 한글과 영문 입력 소스가 전환됩니다.
+오른쪽 `⌘` 또는 Windows 키보드의 오른쪽 `Alt`를 짧게 누르면 한글과
+영문 입력 소스가 전환됩니다.
 
 - 오른쪽 `⌘`: 한/영 전환
+- Windows 키보드의 오른쪽 `Alt`: 한/영 전환
 - 왼쪽 `⌘`: 기존 Command 기능
 - Caps Lock: 기존 대문자 고정 기능
 - `Control-Space`: 기존 macOS 입력 소스 단축키
@@ -96,7 +98,8 @@ cd right-command-hangul
 macOS의 일반 키 상태 API는 왼쪽과 오른쪽 Command 키를 동일하게 취급합니다.
 이를 구분하기 위해 다음과 같이 동작합니다.
 
-1. `/usr/bin/hidutil`로 오른쪽 Command의 HID 코드만 F18에 매핑합니다.
+1. `/usr/bin/hidutil`로 오른쪽 Command와 Right Alt의 HID 코드를 F18에
+   매핑합니다.
 2. 백그라운드 서비스가 F18을 macOS 전역 단축키로 등록합니다.
 3. F18 이벤트를 직접 받아 소비한 뒤 Apple의 Text Input Source API를 사용해
    한국어와 영문 입력 소스를 직접 전환합니다.
@@ -119,6 +122,8 @@ F18은 일반 키보드에 거의 없는 키이므로 다른 키와 충돌할 �
 ## 제한 사항
 
 - 오른쪽 `⌘`는 한/영 전환 전용이 되므로 Command 조합키로 사용할 수 없습니다.
+- macOS에서 Right Alt와 Right Option은 같은 HID 키이므로, 오른쪽 `Option`도
+  한/영 전환 전용이 됩니다.
 - macOS 로그인 화면에서는 동작하지 않습니다. 사용자 로그인 이후에만
   동작합니다.
 - 다른 도구가 `hidutil`의 `UserKeyMapping`을 관리하고 있다면 서로의 매핑을
@@ -130,7 +135,7 @@ F18은 일반 키보드에 거의 없는 키이므로 다른 키와 충돌할 �
 
 ## 문제 해결
 
-### 오른쪽 Command를 눌러도 전환되지 않아요
+### 오른쪽 Command 또는 Alt를 눌러도 전환되지 않아요
 
 서비스가 실행 중인지 확인합니다.
 

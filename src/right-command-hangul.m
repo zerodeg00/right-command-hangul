@@ -96,10 +96,12 @@ static void print_current_source(void) {
     CFRelease(current);
 }
 
-static int set_right_command_mapping(BOOL enabled) {
+static int set_key_mapping(BOOL enabled) {
     const char *mapping = enabled
         ? "{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingSrc\":"
-          "30064771303,\"HIDKeyboardModifierMappingDst\":30064771181}]}"
+          "30064771303,\"HIDKeyboardModifierMappingDst\":30064771181},"
+          "{\"HIDKeyboardModifierMappingSrc\":30064771302,"
+          "\"HIDKeyboardModifierMappingDst\":30064771181}]}"
         : "{\"UserKeyMapping\":[]}";
     char *const arguments[] = {
         "hidutil", "property", "--set", (char *)mapping, NULL
@@ -124,13 +126,13 @@ int main(int argc, const char *argv[]) {
             return toggle_source(NULL) ? 0 : 1;
         }
         if (argc == 2 && strcmp(argv[1], "--apply-mapping") == 0) {
-            return set_right_command_mapping(YES);
+            return set_key_mapping(YES);
         }
         if (argc == 2 && strcmp(argv[1], "--clear-mapping") == 0) {
-            return set_right_command_mapping(NO);
+            return set_key_mapping(NO);
         }
-        if (set_right_command_mapping(YES) != 0) {
-            NSLog(@"Could not map Right Command to F18");
+        if (set_key_mapping(YES) != 0) {
+            NSLog(@"Could not map Right Command and Right Alt to F18");
             return 1;
         }
 

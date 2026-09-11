@@ -15,4 +15,4 @@ fi
 rm -f "$agent_path"
 rm -rf "$install_dir"
 
-printf '%s\n' "Uninstalled. Right Command has been restored."
+printf '%s\n' "Uninstalled. Right Command and Right Alt have been restored."

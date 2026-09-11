@@ -32,4 +32,4 @@ launchctl bootout "gui/$user_id/$label" >/dev/null 2>&1 || true
 sleep 1
 launchctl bootstrap "gui/$user_id" "$agent_path"
 
-printf '%s\n' "Installed. Right Command now switches between Korean and Latin input sources."
+printf '%s\n' "Installed. Right Command and Right Alt now switch between Korean and Latin input sources."
