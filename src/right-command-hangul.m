@@ -101,6 +101,17 @@ static void print_current_source(void) {
     CFRelease(current);
 }
 
+static BOOL per_context_input_is_enabled(void) {
+    CFPropertyListRef value = CFPreferencesCopyValue(
+        CFSTR("AppleGlobalTextInputProperties"),
+        CFSTR("com.apple.HIToolbox"),
+        kCFPreferencesCurrentUser,
+        kCFPreferencesAnyHost);
+    NSDictionary *properties = CFBridgingRelease(value);
+    if (![properties isKindOfClass:[NSDictionary class]]) return NO;
+    return [properties[@"TextInputGlobalPropertyPerContextInput"] boolValue];
+}
+
 static int set_key_mapping(BOOL enabled) {
     const char *mapping = enabled
         ? "{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingSrc\":"
@@ -266,6 +277,10 @@ int main(int argc, const char *argv[]) {
             print_current_source();
             return 0;
         }
+        if (argc == 2 &&
+            strcmp(argv[1], "--per-context-input-enabled") == 0) {
+            return per_context_input_is_enabled() ? 0 : 1;
+        }
         if (argc == 2 && strcmp(argv[1], "--toggle") == 0) {
             return toggle_source() ? 0 : 1;
         }
@@ -278,6 +293,12 @@ int main(int argc, const char *argv[]) {
         signal(SIGTERM, stop_handler);
         signal(SIGINT, stop_handler);
         gHeldEvents = [NSMutableArray array];
+
+        if (per_context_input_is_enabled()) {
+            NSLog(@"Warning: 'Automatically switch to a document's input "
+                  "source' is enabled; per-document input sources may "
+                  "override Right Command Hangul");
+        }
 
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDistributedCenter(),
