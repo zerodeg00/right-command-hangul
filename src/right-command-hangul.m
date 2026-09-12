@@ -11,7 +11,7 @@ extern char **environ;
 
 static const CGKeyCode kTriggerKeyCode = 79; // F18
 static const int64_t kRepostedEventMarker = 0x524348414E47554C; // RCHANGUL
-static const NSTimeInterval kPostNotificationDelay = 0.035;
+static const NSTimeInterval kReadyDelay = 0.010;
 static const NSTimeInterval kSafetyTimeout = 0.250;
 static NSString *const kDefaultLatinSource = @"com.apple.keylayout.ABC";
 static NSString *const kDefaultKoreanSource =
@@ -24,6 +24,7 @@ static CFRunLoopSourceRef gEventTapSource = NULL;
 static NSMutableArray *gHeldEvents = nil;
 static BOOL gTriggerIsDown = NO;
 static BOOL gSwitchIsPending = NO;
+static BOOL gSourceChangeWasObserved = NO;
 static NSUInteger gSwitchGeneration = 0;
 static int gNotificationObserver = 0;
 
@@ -136,6 +137,7 @@ static void release_held_events(NSUInteger generation) {
     if (!gSwitchIsPending || generation != gSwitchGeneration) return;
 
     gSwitchIsPending = NO;
+    gSourceChangeWasObserved = NO;
     NSArray *events = [gHeldEvents copy];
     [gHeldEvents removeAllObjects];
     for (id item in events) {
@@ -167,7 +169,10 @@ static void input_source_changed(CFNotificationCenterRef center,
     (void)user_info;
 
     if (!gSwitchIsPending) return;
-    schedule_release(gSwitchGeneration, kPostNotificationDelay);
+    gSourceChangeWasObserved = YES;
+    if (gHeldEvents.count > 0) {
+        schedule_release(gSwitchGeneration, kReadyDelay);
+    }
 }
 
 static CGEventRef event_tap_callback(CGEventTapProxy proxy,
@@ -199,12 +204,11 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy,
             }
             gSwitchGeneration += 1;
             gSwitchIsPending = YES;
+            gSourceChangeWasObserved = NO;
             NSUInteger generation = gSwitchGeneration;
 
             if (!toggle_source()) {
                 release_held_events(generation);
-            } else {
-                schedule_release(generation, kSafetyTimeout);
             }
         } else if (type == kCGEventKeyUp) {
             gTriggerIsDown = NO;
@@ -212,11 +216,21 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy,
         return NULL;
     }
 
-    if (gSwitchIsPending &&
-        (type == kCGEventKeyDown || type == kCGEventKeyUp)) {
+    CGEventFlags flags = CGEventGetFlags(event);
+    BOOL is_shortcut = (flags & (kCGEventFlagMaskCommand |
+                                 kCGEventFlagMaskControl)) != 0;
+    if (gSwitchIsPending && type == kCGEventKeyDown && !is_shortcut) {
+        BOOL first_held_event = gHeldEvents.count == 0;
         CGEventRef copy = CGEventCreateCopy(event);
         if (copy) {
             [gHeldEvents addObject:CFBridgingRelease(copy)];
+            if (first_held_event) {
+                NSUInteger generation = gSwitchGeneration;
+                schedule_release(generation, kSafetyTimeout);
+                if (gSourceChangeWasObserved) {
+                    schedule_release(generation, kReadyDelay);
+                }
+            }
             return NULL;
         }
     }
