@@ -23,6 +23,7 @@ static CFRunLoopSourceRef gEventTapSource = NULL;
 static NSMutableArray *gHeldEvents = nil;
 static BOOL gTriggerIsDown = NO;
 static BOOL gSwitchIsPending = NO;
+static BOOL gPendingTargetIsKorean = NO;
 static BOOL gSourceChangeWasObserved = NO;
 static NSUInteger gSwitchGeneration = 0;
 static int gNotificationObserver = 0;
@@ -84,15 +85,20 @@ static BOOL select_target_source(BOOL target_is_korean) {
     return YES;
 }
 
-static BOOL toggle_source(void) {
+static BOOL current_source_is_korean(BOOL *is_korean) {
     TISInputSourceRef current = TISCopyCurrentKeyboardInputSource();
     if (!current) return NO;
 
     NSString *current_id = source_string(current, kTISPropertyInputSourceID);
-    BOOL target_is_korean = [current_id hasPrefix:kKoreanSourcePrefix] == NO;
+    *is_korean = [current_id hasPrefix:kKoreanSourcePrefix];
     CFRelease(current);
+    return YES;
+}
 
-    return select_target_source(target_is_korean);
+static BOOL next_target_is_korean(BOOL switch_is_pending,
+                                  BOOL pending_target_is_korean,
+                                  BOOL current_is_korean) {
+    return switch_is_pending ? !pending_target_is_korean : !current_is_korean;
 }
 
 static BOOL should_hold_event(CGEventType type, BOOL switch_is_pending,
@@ -163,6 +169,10 @@ static void input_source_changed(CFNotificationCenterRef center,
     (void)user_info;
 
     if (!gSwitchIsPending) return;
+    BOOL current_is_korean = NO;
+    if (!current_source_is_korean(&current_is_korean) ||
+        current_is_korean != gPendingTargetIsKorean) return;
+
     gSourceChangeWasObserved = YES;
     if (gHeldEvents.count > 0) {
         schedule_release(gSwitchGeneration, kReadyDelay);
@@ -187,12 +197,20 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
     if (key_code == kTriggerKeyCode) {
         if (type == kCGEventKeyDown && !gTriggerIsDown) {
             gTriggerIsDown = YES;
-            if (gSwitchIsPending) release_held_events(gSwitchGeneration);
+            BOOL current_is_korean = NO;
+            if (!gSwitchIsPending &&
+                !current_source_is_korean(&current_is_korean)) {
+                return NULL;
+            }
             gSwitchGeneration += 1;
+            gPendingTargetIsKorean = next_target_is_korean(
+                gSwitchIsPending, gPendingTargetIsKorean, current_is_korean);
             gSwitchIsPending = YES;
             gSourceChangeWasObserved = NO;
-            if (!toggle_source()) {
+            if (!select_target_source(gPendingTargetIsKorean)) {
                 release_held_events(gSwitchGeneration);
+            } else if (gHeldEvents.count > 0) {
+                schedule_release(gSwitchGeneration, kSafetyTimeout);
             }
         } else if (type == kCGEventKeyUp) {
             gTriggerIsDown = NO;
@@ -268,7 +286,9 @@ int main(int argc, const char *argv[]) {
             return 0;
         }
         if (argc == 2 && strcmp(argv[1], "--toggle") == 0) {
-            return toggle_source() ? 0 : 1;
+            BOOL current_is_korean = NO;
+            return current_source_is_korean(&current_is_korean) &&
+                   select_target_source(!current_is_korean) ? 0 : 1;
         }
         if (argc == 2 && strcmp(argv[1], "--apply-mapping") == 0) {
             return set_key_mapping(YES);
