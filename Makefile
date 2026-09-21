@@ -4,7 +4,7 @@ FRAMEWORKS := -framework Foundation -framework Carbon -framework ApplicationServ
 TARGET := build/right-command-hangul
 SOURCE := src/right-command-hangul.m
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall test
 
 all: $(TARGET)
 
@@ -14,6 +14,11 @@ $(TARGET): $(SOURCE)
 
 clean:
 	rm -rf build
+
+test:
+	mkdir -p build
+	$(CC) $(CFLAGS) $(FRAMEWORKS) tests/test-event-kind.m -o build/test-event-kind
+	build/test-event-kind
 
 install:
 	./scripts/install.sh
