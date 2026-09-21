@@ -5,7 +5,9 @@
 #undef main
 
 int main(void) {
-    assert(should_switch_for_event(kEventHotKeyPressed));
-    assert(!should_switch_for_event(kEventHotKeyReleased));
+    assert(should_hold_event(kCGEventKeyDown, YES, NO));
+    assert(should_hold_event(kCGEventKeyUp, YES, NO));
+    assert(!should_hold_event(kCGEventKeyDown, NO, NO));
+    assert(!should_hold_event(kCGEventKeyDown, YES, YES));
     return 0;
 }
