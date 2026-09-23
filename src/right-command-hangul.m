@@ -266,9 +266,12 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
     if (key_code == kTriggerKeyCode) {
         if (type == kCGEventKeyDown && !gTriggerIsDown) {
             gTriggerIsDown = YES;
+            BOOL was_pending = gSwitchIsPending;
             BOOL current_is_korean = NO;
-            if (!gSwitchIsPending &&
-                !current_source_is_korean(&current_is_korean)) {
+            BOOL read_ok = current_source_is_korean(&current_is_korean);
+            if (!gSwitchIsPending && !read_ok) {
+                if (timing_enabled())
+                    NSLog(@"trig: keydown, current-read FAILED -> bail");
                 return NULL;
             }
             gSwitchGeneration += 1;
@@ -276,14 +279,23 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
                 gSwitchIsPending, gPendingTargetIsKorean, current_is_korean);
             gSwitchIsPending = YES;
             gSourceChangeWasObserved = NO;
-            if (timing_enabled()) gSwitchStartTime = CFAbsoluteTimeGetCurrent();
+            if (timing_enabled()) {
+                gSwitchStartTime = CFAbsoluteTimeGetCurrent();
+                NSLog(@"trig: keydown pending=%d curRead(kor)=%d -> target=%s",
+                      was_pending, current_is_korean,
+                      gPendingTargetIsKorean ? "KO" : "EN");
+            }
             if (!select_target_source(gPendingTargetIsKorean)) {
                 release_held_events(gSwitchGeneration);
             } else if (gHeldEvents.count > 0) {
                 schedule_release(gSwitchGeneration, flush_delay(NO));
             }
+        } else if (type == kCGEventKeyDown && gTriggerIsDown) {
+            if (timing_enabled())
+                NSLog(@"trig: keydown IGNORED (trigger already down)");
         } else if (type == kCGEventKeyUp) {
             gTriggerIsDown = NO;
+            if (timing_enabled()) NSLog(@"trig: keyup");
         }
         return NULL;
     }
