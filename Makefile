@@ -19,6 +19,8 @@ test:
 	mkdir -p build
 	$(CC) $(CFLAGS) $(FRAMEWORKS) tests/test-event-kind.m -o build/test-event-kind
 	build/test-event-kind
+	$(CC) $(CFLAGS) $(FRAMEWORKS) tests/test-switch-timing.m -o build/test-switch-timing
+	build/test-switch-timing
 
 install:
 	./scripts/install.sh

@@ -12,7 +12,10 @@ extern char **environ;
 static const CGKeyCode kTriggerKeyCode = 79; // F18
 static const int64_t kRepostedEventMarker = 0x524348414E47554C; // RCHANGUL
 static const NSTimeInterval kReadyDelay = 0.035;
-static const NSTimeInterval kSafetyTimeout = 0.250;
+// Fallback used when the input-source-changed notification is dropped. Kept
+// short so held keys are released promptly instead of stalling; tuned via the
+// RCH_TIMING measurement harness to stay above the real switch latency.
+static const NSTimeInterval kSafetyTimeout = 0.060;
 static NSString *const kDefaultLatinSource = @"com.apple.keylayout.ABC";
 static NSString *const kDefaultKoreanSource =
     @"com.apple.inputmethod.Korean.2SetKorean";
@@ -27,6 +30,11 @@ static BOOL gPendingTargetIsKorean = NO;
 static BOOL gSourceChangeWasObserved = NO;
 static NSUInteger gSwitchGeneration = 0;
 static int gNotificationObserver = 0;
+static int gEnabledSourcesObserver = 0;
+static TISInputSourceRef gCachedKorean = NULL;
+static TISInputSourceRef gCachedLatin = NULL;
+static BOOL gSourceCacheValid = NO;
+static CFAbsoluteTime gSwitchStartTime = 0;
 
 static void stop_handler(int signal_number) {
     (void)signal_number;
@@ -73,13 +81,45 @@ static TISInputSourceRef find_source(NSArray *sources, BOOL korean) {
     return nil;
 }
 
-static BOOL select_target_source(BOOL target_is_korean) {
+static void invalidate_source_cache(void) {
+    if (gCachedKorean) {
+        CFRelease(gCachedKorean);
+        gCachedKorean = NULL;
+    }
+    if (gCachedLatin) {
+        CFRelease(gCachedLatin);
+        gCachedLatin = NULL;
+    }
+    gSourceCacheValid = NO;
+}
+
+// Resolve the Korean and Latin sources once and retain them, so the switch hot
+// path avoids enumerating every enabled source on each key press. Rebuilt only
+// when the enabled input sources change (or when a select fails on a stale ref).
+static void rebuild_source_cache(void) {
+    invalidate_source_cache();
     NSArray *sources = enabled_keyboard_sources();
-    TISInputSourceRef target = find_source(sources, target_is_korean);
+    TISInputSourceRef korean = find_source(sources, YES);
+    TISInputSourceRef latin = find_source(sources, NO);
+    if (korean) gCachedKorean = (TISInputSourceRef)CFRetain(korean);
+    if (latin) gCachedLatin = (TISInputSourceRef)CFRetain(latin);
+    gSourceCacheValid = YES;
+}
+
+static TISInputSourceRef cached_target_source(BOOL target_is_korean) {
+    if (!gSourceCacheValid) rebuild_source_cache();
+    return target_is_korean ? gCachedKorean : gCachedLatin;
+}
+
+static BOOL select_target_source(BOOL target_is_korean) {
+    TISInputSourceRef target = cached_target_source(target_is_korean);
     OSStatus status = target ? TISSelectInputSource(target) : paramErr;
 
     if (status != noErr) {
         NSLog(@"Could not switch input source (status: %d)", status);
+        // A stale cached ref (source enabled/disabled) can cause this; drop the
+        // cache so the next attempt re-resolves against the live source list.
+        invalidate_source_cache();
         return NO;
     }
     return YES;
@@ -105,6 +145,17 @@ static BOOL should_hold_event(CGEventType type, BOOL switch_is_pending,
                               BOOL is_trigger) {
     return switch_is_pending && !is_trigger &&
            (type == kCGEventKeyDown || type == kCGEventKeyUp);
+}
+
+// How long to hold typed keys before flushing them. When the source-change
+// notification has been observed the switch is known complete, so flush on the
+// short ready delay; otherwise fall back to the safety timeout.
+static NSTimeInterval flush_delay(BOOL source_change_observed) {
+    return source_change_observed ? kReadyDelay : kSafetyTimeout;
+}
+
+static BOOL timing_enabled(void) {
+    return getenv("RCH_TIMING") != NULL;
 }
 
 static void print_current_source(void) {
@@ -138,6 +189,12 @@ static int set_key_mapping(BOOL enabled) {
 static void release_held_events(NSUInteger generation) {
     if (!gSwitchIsPending || generation != gSwitchGeneration) return;
 
+    if (timing_enabled()) {
+        NSLog(@"flush: %@ path, %.1f ms, %lu keys",
+              gSourceChangeWasObserved ? @"ready" : @"safety",
+              (CFAbsoluteTimeGetCurrent() - gSwitchStartTime) * 1000.0,
+              (unsigned long)gHeldEvents.count);
+    }
     gSwitchIsPending = NO;
     gSourceChangeWasObserved = NO;
     NSArray *events = [gHeldEvents copy];
@@ -175,8 +232,20 @@ static void input_source_changed(CFNotificationCenterRef center,
 
     gSourceChangeWasObserved = YES;
     if (gHeldEvents.count > 0) {
-        schedule_release(gSwitchGeneration, kReadyDelay);
+        schedule_release(gSwitchGeneration, flush_delay(YES));
     }
+}
+
+static void enabled_sources_changed(CFNotificationCenterRef center,
+                                    void *observer, CFStringRef name,
+                                    const void *object,
+                                    CFDictionaryRef user_info) {
+    (void)center;
+    (void)observer;
+    (void)name;
+    (void)object;
+    (void)user_info;
+    invalidate_source_cache();
 }
 
 static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
@@ -207,10 +276,11 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
                 gSwitchIsPending, gPendingTargetIsKorean, current_is_korean);
             gSwitchIsPending = YES;
             gSourceChangeWasObserved = NO;
+            if (timing_enabled()) gSwitchStartTime = CFAbsoluteTimeGetCurrent();
             if (!select_target_source(gPendingTargetIsKorean)) {
                 release_held_events(gSwitchGeneration);
             } else if (gHeldEvents.count > 0) {
-                schedule_release(gSwitchGeneration, kSafetyTimeout);
+                schedule_release(gSwitchGeneration, flush_delay(NO));
             }
         } else if (type == kCGEventKeyUp) {
             gTriggerIsDown = NO;
@@ -225,9 +295,9 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
         [gHeldEvents addObject:CFBridgingRelease(copy)];
         if (first_held_event) {
             NSUInteger generation = gSwitchGeneration;
-            schedule_release(generation, kSafetyTimeout);
+            schedule_release(generation, flush_delay(NO));
             if (gSourceChangeWasObserved) {
-                schedule_release(generation, kReadyDelay);
+                schedule_release(generation, flush_delay(YES));
             }
         }
         return NULL;
@@ -303,6 +373,12 @@ int main(int argc, const char *argv[]) {
             CFNotificationCenterGetDistributedCenter(), &gNotificationObserver,
             input_source_changed, kTISNotifySelectedKeyboardInputSourceChanged,
             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDistributedCenter(),
+            &gEnabledSourcesObserver, enabled_sources_changed,
+            kTISNotifyEnabledKeyboardInputSourcesChanged, NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        rebuild_source_cache();
 
         BOOL prompted = NO;
         BOOL active = NO;
@@ -328,6 +404,11 @@ int main(int argc, const char *argv[]) {
         CFNotificationCenterRemoveObserver(
             CFNotificationCenterGetDistributedCenter(), &gNotificationObserver,
             kTISNotifySelectedKeyboardInputSourceChanged, NULL);
+        CFNotificationCenterRemoveObserver(
+            CFNotificationCenterGetDistributedCenter(),
+            &gEnabledSourcesObserver,
+            kTISNotifyEnabledKeyboardInputSourcesChanged, NULL);
+        invalidate_source_cache();
     }
     return 0;
 }
