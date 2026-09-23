@@ -109,6 +109,35 @@
 2. **안전한 개선(권장 기본선):** A+macism 방식 프로토타입 — 캐싱 + fire&forget +
    포커스 윈도우 트릭. Tahoe에서 신뢰성 확보되는 유일하게 확실한 경로.
 
+## 실증 스파이크 결과 (B 판정 — 이 Tahoe 머신)
+
+합성 CGEvent로 네이티브 입력소스 단축키가 실제로 트리거되는지 직접 실험.
+
+조건/방법:
+- 프로세스 신뢰: `AXIsProcessTrusted = YES` (터미널 컨텍스트 상속, 실제 앱과 동일 조건).
+- 심볼릭 핫키 60(Ctrl+Space)·61(Ctrl+Opt+Space)을 `defaults`+`activateSettings -u`로
+  임시 활성화(실험 후 원복 완료).
+- 주입 후 **별도 프로세스로 신선하게** 입력소스를 읽어 판정(같은 프로세스 내
+  `TISCopyCurrentKeyboardInputSource`는 stale → false negative 방지).
+
+결과:
+- 대조군(실제 `TISSelectInputSource` = `--toggle`): 신선한 read로 **SWITCHED 정확 감지**
+  → 탐지 방식 유효.
+- 합성 주입: 모든 변형에서 **NOCHANGE**
+  - space+control flag / HID 탭 (3회)
+  - 개별 모디파이어 키다운 순서(Control↓→Space↓↑→Control↑) / HID (2회)
+  - 동일 시퀀스 / Session 탭 (2회)
+  - Ctrl+Opt+Space(61 다음소스) / HID (2회)
+
+**판정: 이 Tahoe(26.2) 머신에서 합성 이벤트로는 입력소스 전환이 트리거되지 않음.**
+nick-liu "Tahoe CGEventPost dead-end" 및 macism의 Tahoe 포커스트릭 선회와 일치.
+(잔여 caveat: 물리 키 입력으로 핫키 live 여부를 100% 확증하진 못함 — 다만
+3스타일×2탭×2ID 전부 실패 + 문헌 정황이 수렴하므로 실무상 결론은 확정적.)
+
+→ **최저지연 후보 B(네이티브 단축키 주입)는 이 환경에서 탈락.** 남는 확실한 경로는
+Karabiner식 TIS(캐싱+fire-and-forget) + macism식 포커스 윈도우 트릭.
+가장 큰 즉효는 **fire-and-forget**(알림 대기 제거 → 현행 0.25s 폴백 지연 소멸).
+
 ## 출처
 - Karabiner: cpp-osx-input_source `input_source.hpp`, cpp-osx-input_source_selector `selector.hpp`,
   Karabiner-Elements `DEVELOPMENT.md`, issue #1602 (CJKV).
