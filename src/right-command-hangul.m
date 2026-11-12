@@ -1,13 +1,11 @@
 #import <ApplicationServices/ApplicationServices.h>
+#import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
 #import <Foundation/Foundation.h>
 #import <dispatch/dispatch.h>
 #import <signal.h>
-#import <spawn.h>
-#import <sys/wait.h>
+#import <IOKit/hidsystem/IOHIDEventSystemClient.h>
 #import <unistd.h>
-
-extern char **environ;
 
 static const CGKeyCode kTriggerKeyCode = 79; // F18
 static const int64_t kRepostedEventMarker = 0x524348414E47554C; // RCHANGUL
@@ -115,24 +113,54 @@ static void print_current_source(void) {
     CFRelease(current);
 }
 
-static int set_key_mapping(BOOL enabled) {
-    const char *mapping = enabled
-        ? "{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingSrc\":"
-          "30064771303,\"HIDKeyboardModifierMappingDst\":30064771181},"
-          "{\"HIDKeyboardModifierMappingSrc\":30064771302,"
-          "\"HIDKeyboardModifierMappingDst\":30064771181}]}"
-        : "{\"UserKeyMapping\":[]}";
-    char *const arguments[] = {
-        "hidutil", "property", "--set", (char *)mapping, NULL
-    };
-    pid_t process = 0;
-    int spawn_status = posix_spawn(
-        &process, "/usr/bin/hidutil", NULL, NULL, arguments, environ);
-    if (spawn_status != 0) return spawn_status;
+static NSArray *updated_key_mapping(NSArray *mappings, BOOL enabled) {
+    if (![mappings isKindOfClass:NSArray.class]) return nil;
+    NSMutableArray *result = [NSMutableArray array];
+    for (NSDictionary *mapping in mappings) {
+        if (![mapping isKindOfClass:NSDictionary.class]) return nil;
+        NSNumber *source = mapping[@"HIDKeyboardModifierMappingSrc"];
+        NSNumber *destination = mapping[@"HIDKeyboardModifierMappingDst"];
+        if (![source isKindOfClass:NSNumber.class] ||
+            ![destination isKindOfClass:NSNumber.class]) return nil;
+        BOOL our_key = source.unsignedLongLongValue == 30064771303ULL ||
+                       source.unsignedLongLongValue == 30064771302ULL;
+        BOOL our_mapping = our_key &&
+                           destination.unsignedLongLongValue == 30064771181ULL;
+        // Do not overwrite a mapping another tool owns for the same key.
+        if (enabled && our_key && !our_mapping) return nil;
+        if (!our_mapping) [result addObject:mapping];
+    }
+    if (enabled) {
+        for (NSNumber *source in @[@30064771303ULL, @30064771302ULL]) {
+            [result addObject:@{@"HIDKeyboardModifierMappingSrc": source,
+                                @"HIDKeyboardModifierMappingDst": @30064771181ULL}];
+        }
+    }
+    return result;
+}
 
-    int status = 0;
-    if (waitpid(process, &status, 0) < 0) return 1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+static NSArray *copy_key_mapping(void) {
+    IOHIDEventSystemClientRef client =
+        IOHIDEventSystemClientCreateSimpleClient(kCFAllocatorDefault);
+    if (!client) return nil;
+    id current = CFBridgingRelease(IOHIDEventSystemClientCopyProperty(
+        client, CFSTR("UserKeyMapping")));
+    CFRelease(client);
+    if (!current) return @[];
+    return updated_key_mapping(current, NO) ? current : nil;
+}
+
+static int set_key_mapping(BOOL enabled) {
+    NSArray *current = copy_key_mapping();
+    if (!current) return 1;
+    IOHIDEventSystemClientRef client =
+        IOHIDEventSystemClientCreateSimpleClient(kCFAllocatorDefault);
+    if (!client) return 1;
+    NSArray *mapping = updated_key_mapping(current, enabled);
+    BOOL success = mapping && IOHIDEventSystemClientSetProperty(
+        client, CFSTR("UserKeyMapping"), (__bridge CFArrayRef)mapping);
+    CFRelease(client);
+    return success ? 0 : 1;
 }
 
 static void release_held_events(NSUInteger generation) {
@@ -258,6 +286,8 @@ static BOOL start_event_tap(void) {
 
 static void stop_event_tap(void) {
     if (gSwitchIsPending) release_held_events(gSwitchGeneration);
+    gTriggerIsDown = NO;
+    gSwitchGeneration += 1;
     if (gEventTapSource) {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), gEventTapSource,
                               kCFRunLoopCommonModes);
@@ -279,8 +309,188 @@ static BOOL accessibility_is_trusted(BOOL prompt) {
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
 }
 
+@interface HangulMenuController : NSObject <NSApplicationDelegate, NSMenuDelegate>
+@property NSStatusItem *statusItem;
+@property NSMenuItem *enabledItem;
+@property NSMenuItem *nativeItem;
+@property NSMenuItem *directItem;
+@property NSMenuItem *statusMessage;
+@property NSMenuItem *helpItem;
+@property NSTimer *timer;
+@property BOOL enabled;
+@property BOOL nativeMode;
+@property BOOL mappingActive;
+@property BOOL mappingFailed;
+@property BOOL prompted;
+@end
+
+@implementation HangulMenuController
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    (void)notification;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults registerDefaults:@{@"MappingEnabled": @YES, @"NativeSwitching": @NO}];
+    self.enabled = [defaults boolForKey:@"MappingEnabled"];
+    self.nativeMode = [defaults boolForKey:@"NativeSwitching"];
+    gHeldEvents = [NSMutableArray array];
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDistributedCenter(), &gNotificationObserver,
+        input_source_changed, kTISNotifySelectedKeyboardInputSourceChanged,
+        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    self.statusItem = [NSStatusBar.systemStatusBar
+        statusItemWithLength:NSVariableStatusItemLength];
+    self.statusItem.button.title = @"한/영";
+    self.statusItem.button.accessibilityLabel = @"Right Command Hangul";
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Right Command Hangul"];
+    menu.autoenablesItems = NO;
+    menu.delegate = self;
+    self.enabledItem = [menu addItemWithTitle:@"오른쪽 ⌘/Alt → F18 매핑 사용"
+        action:@selector(toggleEnabled:) keyEquivalent:@""];
+    [menu addItem:NSMenuItem.separatorItem];
+    self.nativeItem = [menu addItemWithTitle:@"macOS 기본 단축키로 전환"
+        action:@selector(selectMode:) keyEquivalent:@""];
+    self.nativeItem.tag = 1;
+    self.directItem = [menu addItemWithTitle:@"앱에서 직접 전환 (기존 방식)"
+        action:@selector(selectMode:) keyEquivalent:@""];
+    [menu addItem:NSMenuItem.separatorItem];
+    self.statusMessage = [menu addItemWithTitle:@"" action:NULL keyEquivalent:@""];
+    self.statusMessage.enabled = NO;
+    self.helpItem = [menu addItemWithTitle:@"" action:NULL keyEquivalent:@""];
+    self.helpItem.enabled = NO;
+    [menu addItemWithTitle:@"키보드 단축키 설정 열기…"
+        action:@selector(openKeyboardSettings:) keyEquivalent:@""];
+    [menu addItemWithTitle:@"접근성 설정 열기…"
+        action:@selector(openAccessibilitySettings:) keyEquivalent:@""];
+    [menu addItem:NSMenuItem.separatorItem];
+    [menu addItemWithTitle:@"종료 (키 매핑 해제)"
+        action:@selector(quit:) keyEquivalent:@""];
+    for (NSMenuItem *item in menu.itemArray) {
+        if (item.action) item.target = self;
+    }
+    self.statusItem.menu = menu;
+    [self applyConfiguration];
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self
+        selector:@selector(checkRuntime:) userInfo:nil repeats:YES];
+    [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+}
+
+- (void)refreshMenu {
+    self.enabledItem.state = self.enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.nativeItem.state = self.nativeMode ? NSControlStateValueOn : NSControlStateValueOff;
+    self.directItem.state = self.nativeMode ? NSControlStateValueOff : NSControlStateValueOn;
+    self.statusItem.button.title = self.enabled ? @"한/영" : @"한/영 꺼짐";
+    if (self.mappingFailed) {
+        self.statusMessage.title = @"키 매핑 변경에 실패했습니다. 충돌 여부를 확인하세요.";
+    } else if (!self.enabled) {
+        self.statusMessage.title = @"매핑이 꺼져 있습니다.";
+    } else if (!self.nativeMode && !gEventTap) {
+        self.statusMessage.title = @"접근성 권한을 허용해 주세요.";
+    } else if (!self.mappingActive) {
+        self.statusMessage.title = @"키 매핑을 적용하지 못했습니다. 충돌 여부를 확인하세요.";
+    } else if (!self.nativeMode && IsSecureEventInputEnabled()) {
+        self.statusMessage.title = @"보안 입력으로 앱 전환이 차단되어 있습니다.";
+    } else {
+        self.statusMessage.title = @"키 매핑이 켜져 있습니다.";
+    }
+    self.helpItem.title = self.nativeMode
+        ? @"‘이전 입력 소스 선택’ 단축키를 F18로 지정하세요."
+        : @"앱이 F18을 받아 한영을 전환합니다.";
+}
+
+- (void)startDirectSwitching {
+    if (!accessibility_is_trusted(!self.prompted)) {
+        self.prompted = YES;
+        return;
+    }
+    self.prompted = YES;
+    if (!start_event_tap()) NSLog(@"Could not create the keyboard event tap");
+}
+
+- (void)applyConfiguration {
+    stop_event_tap();
+    if (self.enabled && !self.nativeMode) [self startDirectSwitching];
+    BOOL should_map = self.enabled && (self.nativeMode || gEventTap != NULL);
+    if (set_key_mapping(should_map) != 0) {
+        NSLog(@"Could not update the Right Command and Right Alt mapping");
+        self.mappingFailed = YES;
+        stop_event_tap();
+    } else {
+        self.mappingFailed = NO;
+        self.mappingActive = should_map;
+    }
+    [self refreshMenu];
+}
+
+- (void)toggleEnabled:(id)sender {
+    (void)sender;
+    self.enabled = !self.enabled;
+    [NSUserDefaults.standardUserDefaults setBool:self.enabled forKey:@"MappingEnabled"];
+    [self applyConfiguration];
+}
+
+- (void)selectMode:(NSMenuItem *)sender {
+    self.nativeMode = sender.tag == 1;
+    [NSUserDefaults.standardUserDefaults setBool:self.nativeMode forKey:@"NativeSwitching"];
+    [self applyConfiguration];
+}
+
+- (void)openKeyboardSettings:(id)sender {
+    (void)sender;
+    [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:
+        @"x-apple.systempreferences:com.apple.preference.keyboard?Shortcuts"]];
+}
+
+- (void)openAccessibilitySettings:(id)sender {
+    (void)sender;
+    [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:
+        @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]];
+}
+
+- (void)menuWillOpen:(NSMenu *)menu {
+    (void)menu;
+    [self refreshMenu];
+}
+
+- (void)checkRuntime:(NSTimer *)timer {
+    (void)timer;
+    if (!gRunning) {
+        [NSApp terminate:nil];
+        return;
+    }
+    if (self.enabled && !self.nativeMode && !gEventTap &&
+        accessibility_is_trusted(NO)) {
+        [self applyConfiguration];
+    }
+}
+
+- (void)quit:(id)sender {
+    (void)sender;
+    [NSApp terminate:nil];
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+    (void)notification;
+    [self.timer invalidate];
+    stop_event_tap();
+    if (set_key_mapping(NO) != 0) {
+        NSLog(@"Could not clear the Right Command and Right Alt mapping");
+    }
+    CFNotificationCenterRemoveObserver(
+        CFNotificationCenterGetDistributedCenter(), &gNotificationObserver,
+        kTISNotifySelectedKeyboardInputSourceChanged, NULL);
+}
+@end
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc == 2 && strcmp(argv[1], "--print-mapping") == 0) {
+            NSArray *mapping = copy_key_mapping();
+            if (!mapping) return 1;
+            NSData *data = [NSJSONSerialization dataWithJSONObject:
+                @{@"UserKeyMapping": mapping} options:0 error:NULL];
+            if (!data) return 1;
+            return fwrite(data.bytes, 1, data.length, stdout) == data.length ? 0 : 1;
+        }
         if (argc == 2 && strcmp(argv[1], "--current") == 0) {
             print_current_source();
             return 0;
@@ -298,36 +508,16 @@ int main(int argc, const char *argv[]) {
         }
         signal(SIGTERM, stop_handler);
         signal(SIGINT, stop_handler);
-        gHeldEvents = [NSMutableArray array];
-        CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDistributedCenter(), &gNotificationObserver,
-            input_source_changed, kTISNotifySelectedKeyboardInputSourceChanged,
-            NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-
-        BOOL prompted = NO;
-        BOOL active = NO;
-        while (gRunning) {
-            if (!active && accessibility_is_trusted(!prompted)) {
-                prompted = YES;
-                if (!start_event_tap()) {
-                    NSLog(@"Could not create the keyboard event tap");
-                } else if (set_key_mapping(YES) != 0) {
-                    NSLog(@"Could not map Right Command and Right Alt to F18");
-                    stop_event_tap();
-                } else {
-                    active = YES;
-                }
-            } else {
-                prompted = YES;
-            }
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
+        for (NSRunningApplication *running in
+             [NSRunningApplication runningApplicationsWithBundleIdentifier:
+                 @"com.github.right-command-hangul"]) {
+            if (running.processIdentifier != getpid()) return 0;
         }
-
-        if (active) set_key_mapping(NO);
-        stop_event_tap();
-        CFNotificationCenterRemoveObserver(
-            CFNotificationCenterGetDistributedCenter(), &gNotificationObserver,
-            kTISNotifySelectedKeyboardInputSourceChanged, NULL);
+        NSApplication *app = NSApplication.sharedApplication;
+        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        HangulMenuController *controller = [HangulMenuController new];
+        app.delegate = controller;
+        [app run];
     }
     return 0;
 }

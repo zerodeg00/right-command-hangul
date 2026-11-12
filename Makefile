@@ -1,6 +1,6 @@
 CC := clang
 CFLAGS := -fobjc-arc -Wall -Wextra -Werror -O2
-FRAMEWORKS := -framework Foundation -framework Carbon -framework ApplicationServices
+FRAMEWORKS := -framework IOKit -framework AppKit -framework Carbon -framework ApplicationServices
 TARGET := build/right-command-hangul
 SOURCE := src/right-command-hangul.m
 
