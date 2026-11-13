@@ -124,7 +124,8 @@ static NSString *current_source_id(void) {
 static AXUIElementRef copy_focused_element(pid_t pid) {
     if (pid <= 0) return NULL;
     AXUIElementRef app = AXUIElementCreateApplication(pid);
-    AXUIElementSetMessagingTimeout(app, 0.005);
+    // Focused fields can need more than 5ms to answer while the UI is busy.
+    AXUIElementSetMessagingTimeout(app, 0.020);
     CFTypeRef focused = NULL;
     AXError error = AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute, &focused);
     CFRelease(app);
