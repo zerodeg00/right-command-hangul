@@ -25,6 +25,12 @@ static BOOL gPendingTargetIsKorean = NO;
 static BOOL gSourceChangeWasObserved = NO;
 static NSUInteger gSwitchGeneration = 0;
 static int gNotificationObserver = 0;
+static BOOL gNativeProtectionActive = NO;
+static NSString *gNativeInitialSource = nil;
+static pid_t gNativeTargetPID = 0;
+static AXUIElementRef gNativeTargetElement = NULL;
+static BOOL gNativeProtectionCancelled = NO;
+static BOOL gNativeProtectionUnavailable = NO;
 
 static void stop_handler(int signal_number) {
     (void)signal_number;
@@ -99,6 +105,57 @@ static BOOL next_target_is_korean(BOOL switch_is_pending,
     return switch_is_pending ? !pending_target_is_korean : !current_is_korean;
 }
 
+static BOOL native_source_is_ready(NSString *initial, NSString *current) {
+    return initial != nil && current != nil && ![initial isEqualToString:current];
+}
+
+static BOOL needs_event_tap(BOOL enabled, BOOL native_mode, BOOL protection) {
+    return enabled && (!native_mode || protection);
+}
+
+static NSString *current_source_id(void) {
+    TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+    if (!source) return nil;
+    NSString *identifier = [source_string(source, kTISPropertyInputSourceID) copy];
+    CFRelease(source);
+    return identifier;
+}
+
+static AXUIElementRef copy_focused_element(pid_t pid) {
+    if (pid <= 0) return NULL;
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    AXUIElementSetMessagingTimeout(app, 0.005);
+    CFTypeRef focused = NULL;
+    AXError error = AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute, &focused);
+    CFRelease(app);
+    if (error != kAXErrorSuccess || !focused) return NULL;
+    if (CFGetTypeID(focused) != AXUIElementGetTypeID()) {
+        CFRelease(focused);
+        return NULL;
+    }
+    return (AXUIElementRef)focused;
+}
+
+static void clear_native_target(void) {
+    gNativeInitialSource = nil;
+    gNativeTargetPID = 0;
+    if (gNativeTargetElement) CFRelease(gNativeTargetElement);
+    gNativeTargetElement = NULL;
+}
+
+static void cancel_native_protection(void) {
+    if (gHeldEvents.count > 0) {
+        gNativeProtectionCancelled = YES;
+        NSBeep();
+    }
+    [gHeldEvents removeAllObjects];
+    gSwitchIsPending = NO;
+    gSourceChangeWasObserved = NO;
+    gTriggerIsDown = NO;
+    gSwitchGeneration += 1;
+    clear_native_target();
+}
+
 static BOOL should_hold_event(CGEventType type, BOOL switch_is_pending,
                               BOOL is_trigger) {
     return switch_is_pending && !is_trigger &&
@@ -163,8 +220,25 @@ static int set_key_mapping(BOOL enabled) {
     return success ? 0 : 1;
 }
 
-static void release_held_events(NSUInteger generation) {
+static void release_held_events_at_proxy(NSUInteger generation, CGEventTapProxy proxy) {
     if (!gSwitchIsPending || generation != gSwitchGeneration) return;
+
+    if (gNativeProtectionActive) {
+        if (IsSecureEventInputEnabled()) {
+            cancel_native_protection();
+            return;
+        }
+        if (gHeldEvents.count > 0) {
+            AXUIElementRef focused = copy_focused_element(gNativeTargetPID);
+            BOOL same_element = focused && gNativeTargetElement &&
+                                CFEqual(focused, gNativeTargetElement);
+            if (focused) CFRelease(focused);
+            if (!same_element) {
+                cancel_native_protection();
+                return;
+            }
+        }
+    }
 
     gSwitchIsPending = NO;
     gSourceChangeWasObserved = NO;
@@ -174,8 +248,19 @@ static void release_held_events(NSUInteger generation) {
         CGEventRef event = (__bridge CGEventRef)item;
         CGEventSetIntegerValueField(
             event, kCGEventSourceUserData, kRepostedEventMarker);
-        CGEventPost(kCGSessionEventTap, event);
+        if (proxy) {
+            CGEventTapPostEvent(proxy, event);
+        } else if (gNativeProtectionActive && gNativeTargetPID > 0) {
+            CGEventPostToPid(gNativeTargetPID, event);
+        } else {
+            CGEventPost(kCGSessionEventTap, event);
+        }
     }
+    clear_native_target();
+}
+
+static void release_held_events(NSUInteger generation) {
+    release_held_events_at_proxy(generation, NULL);
 }
 
 static void schedule_release(NSUInteger generation, NSTimeInterval delay) {
@@ -184,6 +269,23 @@ static void schedule_release(NSUInteger generation, NSTimeInterval delay) {
         dispatch_get_main_queue(), ^{
             release_held_events(generation);
         });
+}
+
+static void check_native_source(NSUInteger generation) {
+    if (!gNativeProtectionActive || !gSwitchIsPending ||
+        generation != gSwitchGeneration) return;
+    if (IsSecureEventInputEnabled()) {
+        cancel_native_protection();
+        return;
+    }
+    if (native_source_is_ready(gNativeInitialSource, current_source_id())) {
+        gSourceChangeWasObserved = YES;
+        if (!gTriggerIsDown) schedule_release(generation, 0);
+        return;
+    }
+    // Poll only during a switch, because macOS can omit the change notification.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ check_native_source(generation); });
 }
 
 static void input_source_changed(CFNotificationCenterRef center,
@@ -197,6 +299,10 @@ static void input_source_changed(CFNotificationCenterRef center,
     (void)user_info;
 
     if (!gSwitchIsPending) return;
+    if (gNativeProtectionActive) {
+        check_native_source(gSwitchGeneration);
+        return;
+    }
     BOOL current_is_korean = NO;
     if (!current_source_is_korean(&current_is_korean) ||
         current_is_korean != gPendingTargetIsKorean) return;
@@ -214,11 +320,63 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
 
     if (type == kCGEventTapDisabledByTimeout ||
         type == kCGEventTapDisabledByUserInput) {
+        if (gNativeProtectionActive) {
+            release_held_events(gSwitchGeneration);
+            gTriggerIsDown = NO;
+        }
         if (gEventTap) CGEventTapEnable(gEventTap, true);
         return event;
     }
     if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) ==
         kRepostedEventMarker) return event;
+
+    if (gNativeProtectionActive) {
+        if (IsSecureEventInputEnabled()) {
+            cancel_native_protection();
+            return event;
+        }
+        if (gSwitchIsPending &&
+            NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != gNativeTargetPID) {
+            release_held_events(gSwitchGeneration);
+            gTriggerIsDown = NO;
+            return event;
+        }
+        if (type != kCGEventKeyDown && type != kCGEventKeyUp && type != kCGEventFlagsChanged) {
+            // Forward queued keys before a click or modifier can move focus.
+            release_held_events_at_proxy(gSwitchGeneration, proxy);
+            return event;
+        }
+        CGKeyCode key = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        if (key == kTriggerKeyCode) {
+            if (type == kCGEventKeyDown && !gTriggerIsDown &&
+                !CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat)) {
+                release_held_events_at_proxy(gSwitchGeneration, proxy);
+                gNativeProtectionCancelled = NO;
+                gTriggerIsDown = YES;
+                gSwitchGeneration += 1;
+                gNativeInitialSource = current_source_id();
+                gNativeTargetPID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+                gNativeTargetElement = copy_focused_element(gNativeTargetPID);
+                gSwitchIsPending = gNativeInitialSource != nil && gNativeTargetElement != NULL;
+                gNativeProtectionUnavailable = !gSwitchIsPending;
+                gSourceChangeWasObserved = NO;
+                schedule_release(gSwitchGeneration, kSafetyTimeout);
+                check_native_source(gSwitchGeneration);
+            } else if (type == kCGEventKeyUp) {
+                gTriggerIsDown = NO;
+                check_native_source(gSwitchGeneration);
+            } else {
+                return NULL;
+            }
+            return event;
+        }
+        CGEventFlags shortcuts = kCGEventFlagMaskCommand | kCGEventFlagMaskControl |
+                                 kCGEventFlagMaskAlternate;
+        if ((CGEventGetFlags(event) & shortcuts) || key == 48 || key == 53) {
+            release_held_events_at_proxy(gSwitchGeneration, proxy);
+            return event;
+        }
+    }
 
     CGKeyCode key_code = (CGKeyCode)CGEventGetIntegerValueField(
         event, kCGKeyboardEventKeycode);
@@ -246,7 +404,8 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
         return NULL;
     }
 
-    if (should_hold_event(type, gSwitchIsPending, NO)) {
+    if (should_hold_event(type, gSwitchIsPending, NO) ||
+        (gNativeProtectionActive && gSwitchIsPending && type == kCGEventFlagsChanged)) {
         BOOL first_held_event = gHeldEvents.count == 0;
         CGEventRef copy = CGEventCreateCopy(event);
         if (!copy) return event;
@@ -254,7 +413,7 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
         if (first_held_event) {
             NSUInteger generation = gSwitchGeneration;
             schedule_release(generation, kSafetyTimeout);
-            if (gSourceChangeWasObserved) {
+            if (gSourceChangeWasObserved && !gNativeProtectionActive) {
                 schedule_release(generation, kReadyDelay);
             }
         }
@@ -266,6 +425,12 @@ static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type,
 static BOOL start_event_tap(void) {
     CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) |
                        CGEventMaskBit(kCGEventKeyUp);
+    if (gNativeProtectionActive) {
+        mask |= CGEventMaskBit(kCGEventFlagsChanged) |
+                CGEventMaskBit(kCGEventLeftMouseDown) |
+                CGEventMaskBit(kCGEventRightMouseDown) |
+                CGEventMaskBit(kCGEventOtherMouseDown);
+    }
     gEventTap = CGEventTapCreate(
         kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
         mask, event_tap_callback, NULL);
@@ -288,6 +453,7 @@ static void stop_event_tap(void) {
     if (gSwitchIsPending) release_held_events(gSwitchGeneration);
     gTriggerIsDown = NO;
     gSwitchGeneration += 1;
+    clear_native_target();
     if (gEventTapSource) {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), gEventTapSource,
                               kCFRunLoopCommonModes);
@@ -314,11 +480,13 @@ static BOOL accessibility_is_trusted(BOOL prompt) {
 @property NSMenuItem *enabledItem;
 @property NSMenuItem *nativeItem;
 @property NSMenuItem *directItem;
+@property NSMenuItem *protectionItem;
 @property NSMenuItem *statusMessage;
 @property NSMenuItem *helpItem;
 @property NSTimer *timer;
 @property BOOL enabled;
 @property BOOL nativeMode;
+@property BOOL firstCharacterProtection;
 @property BOOL mappingActive;
 @property BOOL mappingFailed;
 @property BOOL prompted;
@@ -328,9 +496,11 @@ static BOOL accessibility_is_trusted(BOOL prompt) {
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    [defaults registerDefaults:@{@"MappingEnabled": @YES, @"NativeSwitching": @NO}];
+    [defaults registerDefaults:@{@"MappingEnabled": @YES, @"NativeSwitching": @NO,
+                                @"NativeFirstCharacterProtection": @NO}];
     self.enabled = [defaults boolForKey:@"MappingEnabled"];
     self.nativeMode = [defaults boolForKey:@"NativeSwitching"];
+    self.firstCharacterProtection = [defaults boolForKey:@"NativeFirstCharacterProtection"];
     gHeldEvents = [NSMutableArray array];
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDistributedCenter(), &gNotificationObserver,
@@ -352,6 +522,8 @@ static BOOL accessibility_is_trusted(BOOL prompt) {
     self.nativeItem.tag = 1;
     self.directItem = [menu addItemWithTitle:@"앱에서 직접 전환 (기존 방식)"
         action:@selector(selectMode:) keyEquivalent:@""];
+    self.protectionItem = [menu addItemWithTitle:@"첫 글자 보호 (실험, 접근성 필요)"
+        action:@selector(toggleProtection:) keyEquivalent:@""];
     [menu addItem:NSMenuItem.separatorItem];
     self.statusMessage = [menu addItemWithTitle:@"" action:NULL keyEquivalent:@""];
     self.statusMessage.enabled = NO;
@@ -378,6 +550,8 @@ static BOOL accessibility_is_trusted(BOOL prompt) {
     self.enabledItem.state = self.enabled ? NSControlStateValueOn : NSControlStateValueOff;
     self.nativeItem.state = self.nativeMode ? NSControlStateValueOn : NSControlStateValueOff;
     self.directItem.state = self.nativeMode ? NSControlStateValueOff : NSControlStateValueOn;
+    self.protectionItem.state = self.firstCharacterProtection ? NSControlStateValueOn : NSControlStateValueOff;
+    self.protectionItem.enabled = self.nativeMode;
     self.statusItem.button.title = self.enabled ? @"한/영" : @"한/영 꺼짐";
     if (self.mappingFailed) {
         self.statusMessage.title = @"키 매핑 변경에 실패했습니다. 충돌 여부를 확인하세요.";
@@ -387,10 +561,19 @@ static BOOL accessibility_is_trusted(BOOL prompt) {
         self.statusMessage.title = @"접근성 권한을 허용해 주세요.";
     } else if (!self.mappingActive) {
         self.statusMessage.title = @"키 매핑을 적용하지 못했습니다. 충돌 여부를 확인하세요.";
+    } else if (self.nativeMode && self.firstCharacterProtection && IsSecureEventInputEnabled()) {
+        self.statusMessage.title = @"보안 입력 중에는 첫 글자 보호를 사용할 수 없습니다.";
+    } else if (self.nativeMode && self.firstCharacterProtection && !gEventTap) {
+        self.statusMessage.title = @"첫 글자 보호에 접근성 권한이 필요합니다.";
+    } else if (self.nativeMode && self.firstCharacterProtection && gNativeProtectionCancelled) {
+        self.statusMessage.title = @"입력란 변경으로 보호 입력을 취소했습니다. 다시 입력해 주세요.";
+    } else if (self.nativeMode && self.firstCharacterProtection && gNativeProtectionUnavailable) {
+        self.statusMessage.title = @"현재 입력란을 확인할 수 없어 기본 F18 방식으로 동작합니다.";
     } else if (!self.nativeMode && IsSecureEventInputEnabled()) {
         self.statusMessage.title = @"보안 입력으로 앱 전환이 차단되어 있습니다.";
     } else {
-        self.statusMessage.title = @"키 매핑이 켜져 있습니다.";
+        self.statusMessage.title = gNativeProtectionActive && gEventTap
+            ? @"F18 매핑과 첫 글자 보호가 켜져 있습니다." : @"키 매핑이 켜져 있습니다.";
     }
     self.helpItem.title = self.nativeMode
         ? @"‘이전 입력 소스 선택’ 단축키를 F18로 지정하세요."
@@ -408,7 +591,10 @@ static BOOL accessibility_is_trusted(BOOL prompt) {
 
 - (void)applyConfiguration {
     stop_event_tap();
-    if (self.enabled && !self.nativeMode) [self startDirectSwitching];
+    gNativeProtectionActive = self.nativeMode && self.firstCharacterProtection;
+    if (needs_event_tap(self.enabled, self.nativeMode, self.firstCharacterProtection)) {
+        [self startDirectSwitching];
+    }
     BOOL should_map = self.enabled && (self.nativeMode || gEventTap != NULL);
     if (set_key_mapping(should_map) != 0) {
         NSLog(@"Could not update the Right Command and Right Alt mapping");
@@ -431,6 +617,16 @@ static BOOL accessibility_is_trusted(BOOL prompt) {
 - (void)selectMode:(NSMenuItem *)sender {
     self.nativeMode = sender.tag == 1;
     [NSUserDefaults.standardUserDefaults setBool:self.nativeMode forKey:@"NativeSwitching"];
+    [self applyConfiguration];
+}
+
+- (void)toggleProtection:(id)sender {
+    (void)sender;
+    self.firstCharacterProtection = !self.firstCharacterProtection;
+    gNativeProtectionCancelled = NO;
+    gNativeProtectionUnavailable = NO;
+    [NSUserDefaults.standardUserDefaults setBool:self.firstCharacterProtection
+                                         forKey:@"NativeFirstCharacterProtection"];
     [self applyConfiguration];
 }
 
@@ -457,7 +653,7 @@ static BOOL accessibility_is_trusted(BOOL prompt) {
         [NSApp terminate:nil];
         return;
     }
-    if (self.enabled && !self.nativeMode && !gEventTap &&
+    if (needs_event_tap(self.enabled, self.nativeMode, self.firstCharacterProtection) && !gEventTap &&
         accessibility_is_trusted(NO)) {
         [self applyConfiguration];
     }
